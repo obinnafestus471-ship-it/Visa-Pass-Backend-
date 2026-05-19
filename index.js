@@ -1,27 +1,29 @@
 const express = require('express');
 const ccxt = require('ccxt');
-const cors = require('cors');const { createClient } = require('@supabase/supabase-js');xconst axios = require('axios'); // Add this for payment check
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios');
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-// Supabase connection (key from environment variable)
+// Supabase connection
 const SUPABASE_URL = 'https://pccuhtlfnfvyitioobko.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const SUPABASE_KEY = 'sb_secret_s1MTGOjGESnYg8NyFR9S6g_FHbOGHTK';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// Your TON wallet address
+// Your TON wallet
 const YOUR_WALLET = 'UQD3d5ZMqpheS51qbgB3A04jrf3pI2V0vXffr3Lu1rbEy7wF';
 
-// Store price history
+// Price history storage
 const priceHistory = {};
+const priceCache = {};
 
 // ============ PRICE CACHE (30 seconds TTL) ============
-const priceCache = {
+const cache = {
   data: {},
   ttl: 30000,
-  
   get(exchange, symbol) {
     const key = `${exchange}:${symbol}`;
     const cached = this.data[key];
@@ -30,13 +32,13 @@ const priceCache = {
     }
     return null;
   },
-  
   set(exchange, symbol, price) {
     const key = `${exchange}:${symbol}`;
     this.data[key] = { price, timestamp: Date.now() };
   }
 };
 
+// Helper functions
 function getPriceFromMinutesAgo(symbol, minutes) {
   const now = Date.now();
   const cutoff = now - (minutes * 60 * 1000);
@@ -74,36 +76,24 @@ async function executeStrategy(userId, exchangeId, action, symbol, savedAmount) 
   }
 }
 
-// ============ PAYMENT CHECK ENDPOINT ============
-
+// ============ PAYMENT CHECK ============
 app.get('/api/check-payment/:userId', async (req, res) => {
   const { userId } = req.params;
-  
   try {
-    // Check TON blockchain for payment
     const url = `https://toncenter.com/api/v2/getTransactions?address=${YOUR_WALLET}&limit=30`;
     const response = await axios.get(url, { timeout: 10000 });
     const data = response.data;
-    
     for (const tx of data.result || []) {
       const txStr = JSON.stringify(tx).toLowerCase();
       if (txStr.includes(userId.toLowerCase())) {
-        // Payment found - unlock user
         await supabase.from('users').update({
           guard_locked: false,
           fee_paid: true,
           last_payment: new Date()
         }).eq('user_id', userId);
-        
-        // Reactivate strategies
-        await supabase.from('strategies').update({
-          is_active: true
-        }).eq('user_id', userId);
-        
         return res.json({ paid: true, message: 'Payment confirmed! Guard unlocked.' });
       }
     }
-    
     return res.json({ paid: false, message: 'Payment not found yet.' });
   } catch (error) {
     console.error('Payment check error:', error.message);
@@ -111,8 +101,7 @@ app.get('/api/check-payment/:userId', async (req, res) => {
   }
 });
 
-// ============ AUTOMATIC PRICE MONITORING ============
-
+// ============ PRICE MONITORING ============
 async function monitorPrices() {
   const now = new Date();
   console.log(`🔍 [${now.toISOString()}] Checking prices...`);
@@ -123,12 +112,7 @@ async function monitorPrices() {
     .eq('is_active', true)
     .lt('last_checked', new Date(Date.now() - 5 * 60 * 1000).toISOString());
   
-  if (error) {
-    console.log('Error fetching strategies:', error.message);
-    return;
-  }
-  
-  if (!strategies || strategies.length === 0) {
+  if (error || !strategies || strategies.length === 0) {
     console.log('No active strategies to check');
     return;
   }
@@ -136,7 +120,6 @@ async function monitorPrices() {
   console.log(`📋 Checking ${strategies.length} active strategies`);
   
   const exchanges = ['binance', 'bybit', 'okx'];
-  
   const neededAssets = new Set();
   for (const strategy of strategies) {
     if (strategy.parsed_strategy && strategy.parsed_strategy.asset) {
@@ -149,12 +132,7 @@ async function monitorPrices() {
     neededSymbols.push(`${asset}/USDT`);
   }
   
-  if (neededSymbols.length === 0) {
-    console.log('No assets to monitor');
-    return;
-  }
-  
-  console.log(`📊 Need prices for: ${neededSymbols.join(', ')}`);
+  if (neededSymbols.length === 0) return;
 
   for (const exchangeId of exchanges) {
     try {
@@ -162,20 +140,15 @@ async function monitorPrices() {
       exchange.enableRateLimit = true;
       
       for (const symbol of neededSymbols) {
-        let currentPrice = priceCache.get(exchangeId, symbol);
+        let currentPrice = cache.get(exchangeId, symbol);
         
         if (currentPrice === null) {
-          try {
-            const ticker = await exchange.fetchTicker(symbol);
-            currentPrice = ticker.last;
-            priceCache.set(exchangeId, symbol, currentPrice);
-            console.log(`📡 Fetched ${exchangeId} ${symbol}: $${currentPrice}`);
-          } catch (fetchError) {
-            console.log(`Failed to fetch ${exchangeId} ${symbol}:`, fetchError.message);
-            continue;
-          }
+          const ticker = await exchange.fetchTicker(symbol);
+          currentPrice = ticker.last;
+          cache.set(exchangeId, symbol, currentPrice);
+          console.log(`📡 Fetched ${exchangeId} ${symbol}: $${currentPrice}`);
         } else {
-          console.log(`💾 Using cached price for ${exchangeId} ${symbol}: $${currentPrice}`);
+          console.log(`💾 Cached ${exchangeId} ${symbol}: $${currentPrice}`);
         }
         
         const asset = symbol.split('/')[0];
@@ -191,9 +164,8 @@ async function monitorPrices() {
           const dropPercent = ((oldPrice - currentPrice) / oldPrice) * 100;
           
           if (parsed.condition === 'drop' && dropPercent >= parsed.threshold) {
-            console.log(`🚨 CRASH DETECTED! ${asset} dropped ${dropPercent.toFixed(2)}% in ${parsed.timeWindow} minutes`);
-            const estimatedPositionValue = 1000;
-            const savedAmount = estimatedPositionValue * (dropPercent / 100);
+            console.log(`🚨 CRASH! ${asset} dropped ${dropPercent.toFixed(2)}%`);
+            const savedAmount = 1000 * (dropPercent / 100);
             await executeStrategy(strategy.user_id, exchangeId, parsed.action, asset, savedAmount);
           }
         }
@@ -205,7 +177,6 @@ async function monitorPrices() {
           .update({ last_checked: new Date().toISOString() })
           .eq('id', strategy.id);
       }
-      
     } catch (error) {
       console.log(`Error with ${exchangeId}:`, error.message);
     }
@@ -213,18 +184,16 @@ async function monitorPrices() {
 }
 
 setInterval(monitorPrices, 120000);
-console.log('🚀 Automatic price monitoring started! Checking every 2 minutes');
-
+console.log('🚀 Price monitoring started! Every 2 minutes');
 setTimeout(() => monitorPrices(), 5000);
 
 // ============ API ENDPOINTS ============
-
 app.get('/', (req, res) => {
-  res.json({ message: 'CrashGuard Backend Dey Work! 🚀', status: 'online', auto_monitor: 'active' });
+  res.json({ message: 'CrashGuard Backend Dey Work! 🚀', status: 'online' });
 });
 
 app.get('/api/status', (req, res) => {
-  res.json({ status: 'online', auto_monitor: 'active', cache_ttl: '30 seconds', check_interval: '2 minutes', time: new Date().toISOString() });
+  res.json({ status: 'online', time: new Date().toISOString() });
 });
 
 app.post('/api/connect', async (req, res) => {
@@ -330,9 +299,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 CrashGuard Backend Running on port ${PORT}`);
   console.log(`🌐 English + Hindi support enabled`);
-  console.log(`📊 Price cache TTL: 30 seconds`);
-  console.log(`📊 Check interval: 2 minutes`);
-  console.log(`📊 Only checking active strategies`);
-  console.log(`💳 Payment check endpoint: /api/check-payment/:userId`);
-  console.log(`🔑 Supabase key from environment variable`);
+  console.log(`💳 Payment check: /api/check-payment/:userId`);
 });
