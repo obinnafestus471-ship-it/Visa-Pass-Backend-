@@ -2,6 +2,7 @@ const express = require('express');
 const ccxt = require('ccxt');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios'); // Add this for payment check
 const app = express();
 
 app.use(cors());
@@ -11,6 +12,9 @@ app.use(express.json());
 const SUPABASE_URL = 'https://pccuhtlfnfvyitioobko.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Your TON wallet address
+const YOUR_WALLET = 'UQD3d5ZMqpheS51qbgB3A04jrf3pI2V0vXffr3Lu1rbEy7wF';
 
 // Store price history
 const priceHistory = {};
@@ -72,6 +76,43 @@ async function executeStrategy(userId, exchangeId, action, symbol, savedAmount) 
   }
 }
 
+// ============ PAYMENT CHECK ENDPOINT ============
+
+app.get('/api/check-payment/:userId', async (req, res) => {
+  const { userId } = req.params;
+  
+  try {
+    // Check TON blockchain for payment
+    const url = `https://toncenter.com/api/v2/getTransactions?address=${YOUR_WALLET}&limit=30`;
+    const response = await axios.get(url, { timeout: 10000 });
+    const data = response.data;
+    
+    for (const tx of data.result || []) {
+      const txStr = JSON.stringify(tx).toLowerCase();
+      if (txStr.includes(userId.toLowerCase())) {
+        // Payment found - unlock user
+        await supabase.from('users').update({
+          guard_locked: false,
+          fee_paid: true,
+          last_payment: new Date()
+        }).eq('user_id', userId);
+        
+        // Reactivate strategies
+        await supabase.from('strategies').update({
+          is_active: true
+        }).eq('user_id', userId);
+        
+        return res.json({ paid: true, message: 'Payment confirmed! Guard unlocked.' });
+      }
+    }
+    
+    return res.json({ paid: false, message: 'Payment not found yet.' });
+  } catch (error) {
+    console.error('Payment check error:', error.message);
+    return res.json({ paid: false, message: 'Error checking payment. Try again.' });
+  }
+});
+
 // ============ AUTOMATIC PRICE MONITORING ============
 
 async function monitorPrices() {
@@ -122,7 +163,6 @@ async function monitorPrices() {
       const exchange = new ccxt[exchangeId]();
       exchange.enableRateLimit = true;
       
-      // Check all symbols for this exchange
       for (const symbol of neededSymbols) {
         let currentPrice = priceCache.get(exchangeId, symbol);
         
@@ -143,7 +183,6 @@ async function monitorPrices() {
         const asset = symbol.split('/')[0];
         addToPriceHistory(asset, currentPrice);
         
-        // Check each strategy against this price
         for (const strategy of strategies) {
           const parsed = strategy.parsed_strategy;
           if (!parsed || parsed.asset !== asset) continue;
@@ -162,7 +201,6 @@ async function monitorPrices() {
         }
       }
       
-      // UPDATE last_checked ONCE per strategy (outside symbol loop)
       for (const strategy of strategies) {
         await supabase
           .from('strategies')
@@ -297,5 +335,6 @@ app.listen(PORT, () => {
   console.log(`📊 Price cache TTL: 30 seconds`);
   console.log(`📊 Check interval: 2 minutes`);
   console.log(`📊 Only checking active strategies`);
+  console.log(`💳 Payment check endpoint: /api/check-payment/:userId`);
   console.log(`🔑 Supabase key from environment variable`);
 });
