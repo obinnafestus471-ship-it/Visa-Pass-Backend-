@@ -1,0 +1,390 @@
+const express = require('express');
+const cors = require('cors');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+// ============================================================
+// GEMINI API KEY (Hardcoded - From Your Curl)
+// ============================================================
+const GEMINI_API_KEY = 'AQ.Ab8RN6LDGjxqZkn7tR0oyeFJvdpryv4PKzonQIiob7LYIuzJiA';
+
+// ============================================================
+// CALL GEMINI API (Using Fetch - Same as Curl)
+// ============================================================
+async function callGemini(prompt) {
+  try {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-goog-api-key': GEMINI_API_KEY
+      },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{
+            text: prompt
+          }]
+        }]
+      })
+    });
+
+    const data = await response.json();
+    
+    if (!response.ok) {
+      throw new Error(`Gemini error: ${data.error?.message || response.status}`);
+    }
+
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || 'No response';
+  } catch (error) {
+    console.error('❌ Gemini error:', error);
+    throw error;
+  }
+}
+
+// ============================================================
+// DETECT TOPIC
+// ============================================================
+async function detectTopic(text) {
+  try {
+    const prompt = `What is the main topic of this text? Return only the topic name (2-5 words), nothing else. TEXT: ${text.slice(0, 1000)}`;
+    const result = await callGemini(prompt);
+    return result.trim() || 'Your topic';
+  } catch (error) {
+    console.error('Topic detection error:', error);
+    return 'Your topic';
+  }
+}
+
+// ============================================================
+// GENERATE ALL LEVELS AT ONCE (1 API Call!)
+// ============================================================
+async function generateAllLevels(text, topic, studentName, lang) {
+  const langInstruction = lang === 'pidgin'
+    ? 'Write in NATURAL NIGERIAN PIDGIN ENGLISH only. Use "na", "dey", "wey", "abeg", "oya".'
+    : 'Write in SIMPLE ENGLISH only. Use "is", "are", "the".';
+
+  const levels = {};
+
+  // LEVEL 0: Normal summary
+  const level0Prompt = `You are a friendly tutor named "LTC" talking to a student named ${studentName}.
+
+TOPIC: ${topic}
+LANGUAGE: ${lang === 'pidgin' ? 'PIDGIN' : 'ENGLISH'}
+
+${langInstruction}
+
+Write a clear, easy-to-understand summary of this text. Use everyday analogies (market, traffic, cooking, factory, soup).
+
+TEXT: ${text.slice(0, 6000)}
+
+RULES:
+- Start by saying: "${studentName}, this topic is about... [topic]"
+- Call the student by name at least 3-4 times
+- Format technical terms like **[Term]** (Meaning: *simple explanation*)
+- Do not add a title. Just the friendly explanation.`;
+
+  const level0 = await callGemini(level0Prompt);
+
+  // LEVEL 1: Simpler
+  const level1Prompt = `This is LEVEL 1 breakdown for a student named ${studentName} who said "I NO UNDERSTAND".
+
+TOPIC: ${topic}
+
+${langInstruction}
+
+Make this EVEN SIMPLER than the previous explanation. Use smaller words. Use more analogies.
+
+PREVIOUS EXPLANATION:
+"""${level0}"""
+
+RULES:
+- Start with: "${studentName}, make I explain am another way..."
+- Use even more everyday examples
+- Call the student by name often
+- Keep the format: **[Term]** (Meaning: *simple explanation*)`;
+
+  const level1 = await callGemini(level1Prompt);
+
+  // LEVEL 2: Even simpler
+  const level2Prompt = `This is LEVEL 2 breakdown for ${studentName}. They still don't understand. Make it EVEN SIMPLER.
+
+TOPIC: ${topic}
+
+${langInstruction}
+
+Explain like you dey talk to a 10-year-old. Use very basic words. Use real-life examples they see every day.
+
+PREVIOUS EXPLANATION:
+"""${level1}"""
+
+RULES:
+- Start with: "${studentName}, no worry! Let me try again..."
+- Use very simple words
+- Add more analogies
+- Break into small steps`;
+
+  const level2 = await callGemini(level2Prompt);
+
+  // LEVEL 3: Small pikin explanation
+  const level3Prompt = `This is LEVEL 3 breakdown for ${studentName}. They STILL don't understand. Make it SUPER SIMPLE.
+
+TOPIC: ${topic}
+
+${langInstruction}
+
+Explain like you dey talk to a 5-year-old. Use the simplest words possible. Use one simple analogy.
+
+PREVIOUS EXPLANATION:
+"""${level2}"""
+
+RULES:
+- Start with: "${studentName}, abeg listen small o! Na wetin e mean be say..."
+- Use very basic words
+- One simple analogy
+- Call the student by name at least 2 times
+- Keep the format: **[Term]** (Meaning: *very simple explanation*)`;
+
+  const level3 = await callGemini(level3Prompt);
+
+  levels.level0 = level0;
+  levels.level1 = level1;
+  levels.level2 = level2;
+  levels.level3 = level3;
+
+  return levels;
+}
+
+// ============================================================
+// ENDPOINT 1: /api/cook
+// ============================================================
+app.post('/api/cook', async (req, res) => {
+  try {
+    const { text, title, lang, userName } = req.body;
+    
+    if (!text) {
+      return res.status(400).json({ error: 'Text is required' });
+    }
+
+    const studentName = userName || 'Student';
+    const topic = await detectTopic(text);
+    console.log('📌 Topic detected:', topic);
+
+    const levels = await generateAllLevels(text, topic, studentName, lang);
+
+    res.json({
+      success: true,
+      topic: topic,
+      levels: levels,
+      apiUsed: 'gemini'
+    });
+
+  } catch (error) {
+    console.error('❌ Cook error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// ENDPOINT 2: /api/breakdown
+// ============================================================
+app.post('/api/breakdown', async (req, res) => {
+  try {
+    const { text, level, lang, userName } = req.body;
+    
+    if (!text) {
+      return res.status(400).json({ error: 'Text is required' });
+    }
+
+    const studentName = userName || 'Student';
+    const breakdownLevel = level || 1;
+
+    const langInstruction = lang === 'pidgin'
+      ? 'Write in NATURAL NIGERIAN PIDGIN ENGLISH only. NO English at all. Use "na", "dey", "wey", "abeg", "oya".'
+      : 'Write in SIMPLE ENGLISH only. NO Pidgin at all. Use "is", "are", "the".';
+
+    const intro = lang === 'pidgin'
+      ? `${studentName}, no worry o! Make I explain am another way...`
+      : `${studentName}, don\'t worry! Let me explain it another way...`;
+
+    const prompt = `You are a friendly tutor named "LTC" talking to a student named ${studentName}.
+
+The student said they don't understand this concept. This is breakdown level ${breakdownLevel}. Make it even SIMPLER.
+
+${langInstruction}
+
+CURRENT EXPLANATION:
+"""${text}"""
+
+RULES FOR LEVEL ${breakdownLevel}:
+- Use even MORE everyday analogies (market, traffic, cooking, factory, soup)
+- Use SMALLER words (like you're explaining to a 10-year-old)
+- Add MORE examples from real life
+- Start with: "${intro}"
+- Call the student by name often
+- If level > 2, break into tiny steps
+- Keep the format: **[Term]** (Meaning: [Term]: *simple explanation*)
+
+Write the new, simpler explanation:`;
+
+    const simplified = await callGemini(prompt);
+
+    res.json({
+      success: true,
+      simplified: simplified,
+      apiUsed: 'gemini'
+    });
+
+  } catch (error) {
+    console.error('❌ Breakdown error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// ENDPOINT 3: /api/quiz
+// ============================================================
+app.post('/api/quiz', async (req, res) => {
+  try {
+    const { text, lang, userName } = req.body;
+    
+    if (!text) {
+      return res.status(400).json({ error: 'Text is required' });
+    }
+
+    const studentName = userName || 'Student';
+
+    const quizPrompt = `Based on this study material, generate an exam-grade quiz.
+
+MATERIAL:
+"""${text.slice(0, 4000)}"""
+
+RULES:
+- Write ALL questions in REAL ENGLISH — like a proper university exam
+- Use proper English grammar and vocabulary
+- Questions must be the same style as real exams
+- Exactly 5 questions in this order: easy, medium, medium, killer, killer
+- MCQ options must have exactly 4 choices
+
+Return ONLY valid JSON:
+{
+  "questions": [
+    {
+      "type": "mcq",
+      "difficulty": "easy",
+      "question": "What does CLT stand for?",
+      "options": ["Central Learning Theory", "Central Limit Theorem", "Common Logic Test", "None of the above"],
+      "correctAnswer": "Central Limit Theorem"
+    },
+    {
+      "type": "mcq",
+      "difficulty": "medium",
+      "question": "Question 2...",
+      "options": ["A", "B", "C", "D"],
+      "correctAnswer": "A"
+    },
+    {
+      "type": "fill",
+      "difficulty": "medium",
+      "question": "Question with ____ blank...",
+      "correctAnswer": "Answer here"
+    },
+    {
+      "type": "theory",
+      "difficulty": "killer",
+      "question": "Question...",
+      "correctAnswer": "Model answer here"
+    },
+    {
+      "type": "mcq",
+      "difficulty": "killer",
+      "question": "Question...",
+      "options": ["A", "B", "C", "D"],
+      "correctAnswer": "C"
+    }
+  ]
+}`;
+
+    const result = await callGemini(quizPrompt);
+    let cleaned = result.replace(/```json/g, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(cleaned);
+    const questions = parsed.questions;
+
+    const langInstruction = lang === 'pidgin'
+      ? 'Write in NATURAL NIGERIAN PIDGIN ENGLISH. Use "na", "dey", "wey", "abeg", "oya". NO English at all.'
+      : 'Write in SIMPLE ENGLISH. NO Pidgin at all. Use simple words.';
+
+    for (let q of questions) {
+      const wrongOptions = q.options ? q.options.filter(o => o !== q.correctAnswer) : [];
+
+      let explainPrompt;
+      
+      if (lang === 'pidgin') {
+        explainPrompt = `Explain why the answer is correct for this exam question. Write in PIDGIN ENGLISH.
+
+QUESTION: ${q.question}
+CORRECT ANSWER: ${q.correctAnswer}
+${wrongOptions.length > 0 ? 'WRONG OPTIONS: ' + wrongOptions.join(', ') : ''}
+STUDENT NAME: ${studentName}
+
+RULES:
+- Start with: "${studentName}, make I explain am o!"
+- If wrong options: say "❌ [wrong option] no correct because..." for each wrong option
+- Say "✅ [correct answer] correct because..." and explain
+- Include simple meaning if technical term
+- End with encouragement
+
+Write the explanation in PIDGIN ENGLISH only:`;
+      } else {
+        explainPrompt = `Explain why the answer is correct for this exam question. Write in SIMPLE ENGLISH.
+
+QUESTION: ${q.question}
+CORRECT ANSWER: ${q.correctAnswer}
+${wrongOptions.length > 0 ? 'WRONG OPTIONS: ' + wrongOptions.join(', ') : ''}
+STUDENT NAME: ${studentName}
+
+RULES:
+- Start with: "${studentName}, let me explain!"
+- If wrong options: say "❌ [wrong option] is wrong because..." for each wrong option
+- Say "✅ [correct answer] is correct because..." and explain
+- Include simple meaning if technical term
+- End with encouragement
+
+Write the explanation in SIMPLE ENGLISH only:`;
+      }
+
+      const explanation = await callGemini(explainPrompt);
+      q.explanation = explanation;
+      q.why = explanation;
+    }
+
+    res.json({
+      success: true,
+      questions: questions,
+      apiUsed: 'gemini'
+    });
+
+  } catch (error) {
+    console.error('❌ Quiz error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+app.get('/', (req, res) => {
+  res.json({
+    status: 'OK',
+    message: '🚀 LTC Backend is running!',
+    apiUsed: 'gemini-flash-latest',
+    endpoints: ['POST /api/cook', 'POST /api/breakdown', 'POST /api/quiz']
+  });
+});
+
+// ============================================================
+// EXPORT FOR PXXL (Serverless)
+// ============================================================
+module.exports = app;o
